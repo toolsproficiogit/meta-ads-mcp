@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meta-ads-mcp-cloudrun"
+version = "0.1.0"
+description = "Meta Ads MCP server (read-only) for Google Cloud Run with Bearer auth and server-side Meta System User token."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name="Your Team"}]
+dependencies = [
+  "mcp>=1.8.0",
+  "fastapi>=0.111.0",
+  "uvicorn[standard]>=0.30.0",
+  "httpx>=0.27.0",
+  "tenacity>=8.2.3",
+  "pydantic>=2.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "ruff>=0.5.0"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
