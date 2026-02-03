@@ -35,8 +35,24 @@ def register_read_tools(mcp, settings: Settings) -> None:
         guard(tool)
         # /me/adaccounts returns ad account nodes. Request a small, safe field set.
         params = _paginate_params(limit, after)
-        params["fields"] = "account_id,name,account_status,currency,timezone_name,business,owner"
-        return await client.get("/me/adaccounts", params=params)
+        params["fields"] = "id,account_id,name,account_status,currency,timezone_name,business,owner"
+        resp = await client.get("/me/adaccounts", params=params)
+
+        # Server-level allowlist: if ALLOWED_AD_ACCOUNTS is set, filter the listing too.
+        # (Otherwise callers could discover accounts via list and then get blocked later.)
+        if settings.allowed_ad_accounts and isinstance(resp, dict) and isinstance(resp.get("data"), list):
+            allowed = settings.allowed_ad_accounts
+            resp["data"] = [
+                node
+                for node in resp["data"]
+                if isinstance(node, dict)
+                and (
+                    (node.get("id") in allowed)
+                    or (node.get("account_id") in allowed)
+                    or (f"act_{node.get('account_id')}" in allowed if node.get("account_id") else False)
+                )
+            ]
+        return resp
 
     @mcp.tool(
         name="mcp_meta_ads_get_account",

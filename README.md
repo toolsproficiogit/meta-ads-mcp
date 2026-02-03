@@ -100,9 +100,23 @@ gcloud services enable \
 ### Option A (Recommended): store secrets in Secret Manager
 
 ```bash
-# Create secrets (you will paste values when prompted)
-echo -n "PASTE_META_SYSTEM_USER_TOKEN_HERE" | gcloud secrets create META_ACCESS_TOKEN --data-file=-
-echo -n "CHOOSE_A_LONG_RANDOM_BEARER_TOKEN" | gcloud secrets create API_BEARER_TOKEN --data-file=-
+# ---- 1) Generate an MCP bearer token (the same pattern used in your Google Ads MCP) ----
+export MCP_BEARER_TOKEN="$(openssl rand -hex 32)"
+echo "$MCP_BEARER_TOKEN"
+
+# Store it somewhere safe (password manager). You'll paste it into n8n later.
+
+# ---- 2) Create secrets if needed, then add a new version (idempotent) ----
+
+# Secret: META_ACCESS_TOKEN (paste your System User token)
+gcloud secrets create META_ACCESS_TOKEN --replication-policy="automatic" \
+  2>/dev/null || echo "Secret META_ACCESS_TOKEN exists, adding a new version..."
+printf "%s" "PASTE_META_SYSTEM_USER_TOKEN_HERE" | gcloud secrets versions add META_ACCESS_TOKEN --data-file=-
+
+# Secret: API_BEARER_TOKEN (use the generated token)
+gcloud secrets create API_BEARER_TOKEN --replication-policy="automatic" \
+  2>/dev/null || echo "Secret API_BEARER_TOKEN exists, adding a new version..."
+printf "%s" "$MCP_BEARER_TOKEN" | gcloud secrets versions add API_BEARER_TOKEN --data-file=-
 
 # Grant Cloud Run access to secrets at runtime
 gcloud secrets add-iam-policy-binding META_ACCESS_TOKEN \
@@ -177,7 +191,7 @@ In n8n, when adding an MCP (Streamable HTTP) tool/server:
 
 ## Account allowlist (security)
 
-Limit which ad accounts can be queried by *any* tool that accepts `account_id`:
+Limit which ad accounts can be queried by *any* tool that accepts `account_id` **and** limit what `mcp_meta_ads_list_accounts` returns:
 
 - `ALLOWED_AD_ACCOUNTS` — comma-separated list, e.g. `act_123,act_456`
 
@@ -196,7 +210,74 @@ Precedence:
 
 ---
 
-# 5) Local development
+# 5) Updating critical components (tokens, allowlists)
+
+Cloud Run resolves Secret Manager references at **deploy time**. If you rotate a secret version, you must create a **new Cloud Run revision** (re-deploy) for the service to pick up `:latest`.
+
+## 5.1 Rotate Meta System User token (META_ACCESS_TOKEN)
+
+```bash
+# Add a new secret version
+printf "%s" "PASTE_NEW_META_SYSTEM_USER_TOKEN" | gcloud secrets versions add META_ACCESS_TOKEN --data-file=-
+
+# Roll out a new revision so Cloud Run picks up :latest
+gcloud run deploy "$SERVICE_NAME" \
+  --image "gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest" \
+  --region "$REGION" \
+  --platform managed \
+  --allow-unauthenticated \
+  --set-env-vars META_API_VERSION="v20.0",REQUEST_TIMEOUT_SECONDS="30" \
+  --set-secrets META_ACCESS_TOKEN=META_ACCESS_TOKEN:latest,API_BEARER_TOKEN=API_BEARER_TOKEN:latest
+```
+
+## 5.2 Rotate MCP Bearer token (API_BEARER_TOKEN)
+
+```bash
+# Generate a new token
+export MCP_BEARER_TOKEN="$(openssl rand -hex 32)"
+echo "$MCP_BEARER_TOKEN"
+
+# Add as a new secret version
+printf "%s" "$MCP_BEARER_TOKEN" | gcloud secrets versions add API_BEARER_TOKEN --data-file=-
+
+# Roll out a new revision
+gcloud run deploy "$SERVICE_NAME" \
+  --image "gcr.io/${PROJECT_ID}/${SERVICE_NAME}:latest" \
+  --region "$REGION" \
+  --platform managed \
+  --allow-unauthenticated \
+  --set-env-vars META_API_VERSION="v20.0",REQUEST_TIMEOUT_SECONDS="30" \
+  --set-secrets META_ACCESS_TOKEN=META_ACCESS_TOKEN:latest,API_BEARER_TOKEN=API_BEARER_TOKEN:latest
+```
+
+## 5.3 Update account allowlist (ALLOWED_AD_ACCOUNTS)
+
+```bash
+# Example: restrict to only these accounts
+export ALLOWED_AD_ACCOUNTS="act_123,act_456"
+
+gcloud run services update "$SERVICE_NAME" \
+  --region "$REGION" \
+  --set-env-vars ALLOWED_AD_ACCOUNTS="$ALLOWED_AD_ACCOUNTS"
+```
+
+## 5.4 Temporarily disable high-sensitivity tools (e.g., insights)
+
+```bash
+# Disable insights
+gcloud run services update "$SERVICE_NAME" \
+  --region "$REGION" \
+  --set-env-vars DISABLED_TOOLS="mcp_meta_ads_get_insights"
+
+# Or disable all "get_*" tools quickly via prefix wildcard
+gcloud run services update "$SERVICE_NAME" \
+  --region "$REGION" \
+  --set-env-vars DISABLED_TOOLS="mcp_meta_ads_get_*"
+```
+
+---
+
+# 6) Local development
 
 ```bash
 export META_ACCESS_TOKEN="..."
