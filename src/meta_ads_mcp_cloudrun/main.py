@@ -1,5 +1,6 @@
+import contextlib
 import os
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -7,6 +8,9 @@ import uvicorn
 
 from mcp.server.fastmcp import FastMCP
 
+# -----------------------------
+# Env / config
+# -----------------------------
 
 def _require_env(name: str) -> str:
     v = os.getenv(name)
@@ -20,7 +24,11 @@ MCP_BASE_PATH = "/mcp"
 PUBLIC_PATHS = {"/healthz"}
 
 
-# CRITICAL: prevents 307 /mcp -> /mcp/ redirects (including POST)
+# -----------------------------
+# FastAPI app
+# -----------------------------
+# IMPORTANT: prevents Starlette/FastAPI from issuing 307 redirects for /mcp -> /mcp/
+# (including for POST), which breaks MCP clients like n8n.
 app = FastAPI(redirect_slashes=False)
 
 
@@ -28,11 +36,11 @@ app = FastAPI(redirect_slashes=False)
 async def bearer_auth(request: Request, call_next):
     path = request.url.path
 
-    # Unauthed health checks
+    # Public probe endpoint
     if path in PUBLIC_PATHS:
         return await call_next(request)
 
-    # MCP paths: accept both /mcp and /mcp/... (including /mcp/)
+    # Protect MCP endpoints (/mcp and anything under it)
     if path == MCP_BASE_PATH or path.startswith(MCP_BASE_PATH + "/"):
         auth = request.headers.get("authorization") or request.headers.get("Authorization")
         if not auth or not auth.lower().startswith("bearer "):
@@ -42,7 +50,7 @@ async def bearer_auth(request: Request, call_next):
             return JSONResponse({"error": "invalid_bearer_token"}, status_code=401)
         return await call_next(request)
 
-    # Everything else protected too (defense-in-depth)
+    # Defense-in-depth: require bearer for all other routes too
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if not auth or not auth.lower().startswith("bearer "):
         return JSONResponse({"error": "missing_bearer_token"}, status_code=401)
@@ -57,56 +65,57 @@ def healthz():
     return {"ok": True}
 
 
-# ---- MCP server wiring ----
-mcp = FastMCP(name="Meta Ads MCP (Cloud Run, Read-Only)")
+# -----------------------------
+# MCP server wiring (official MCP Python SDK)
+# -----------------------------
+# Use stateless_http=True for cloud deployments unless you need session persistence.
+# json_response=True can help clients that don't want SSE-style streaming;
+# leave it False unless you know you need JSON-only responses.
+mcp = FastMCP(
+    name="Meta Ads MCP (Cloud Run, Read-Only)",
+    stateless_http=True,
+)
 
-# Keep your existing tool registration approach.
-# (Adjust this import to match your repo if needed.)
-try:
-    from meta_ads_mcp_cloudrun.tools.register import register_read_tools  # type: ignore
-    register_read_tools(mcp)
-except Exception:
-    # If your repo registers tools elsewhere, keep your existing imports/registration.
-    pass
+# Register tools (keep your repo pattern)
+from meta_ads_mcp_cloudrun.tools.register import register_read_tools
+register_read_tools(mcp)
 
+# In the official MCP SDK, Streamable HTTP ASGI app comes from streamable_http_app()
+mcp_asgi_app = mcp.streamable_http_app()
 
-def _get_mcp_asgi_app(mcp_obj: Any):
-    """
-    Compatibility shim for different MCP Python SDK versions.
-
-    Known variants across releases:
-      - FastMCP.get_asgi_app()
-      - FastMCP.asgi_app()
-      - FastMCP.app   (property)
-    """
-    if hasattr(mcp_obj, "get_asgi_app") and callable(getattr(mcp_obj, "get_asgi_app")):
-        return mcp_obj.get_asgi_app()
-
-    if hasattr(mcp_obj, "asgi_app") and callable(getattr(mcp_obj, "asgi_app")):
-        return mcp_obj.asgi_app()
-
-    if hasattr(mcp_obj, "app"):
-        return getattr(mcp_obj, "app")
-
-    raise RuntimeError(
-        "Unable to expose MCP as ASGI app. "
-        "Your installed mcp.server.fastmcp.FastMCP does not provide get_asgi_app/asgi_app/app. "
-        "Pin/upgrade the MCP Python SDK or update wiring accordingly."
-    )
+# Mount MCP endpoint
+app.mount(MCP_BASE_PATH, mcp_asgi_app)
 
 
-mcp_app = _get_mcp_asgi_app(mcp)
+# -----------------------------
+# Lifespan: start session manager if present (safe no-op if not)
+# -----------------------------
+@contextlib.asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Some MCP SDK versions require the session manager to run when mounted.
+    # If your version doesn't, this still works.
+    sm = getattr(mcp, "session_manager", None)
+    if sm is not None and hasattr(sm, "run"):
+        async with sm.run():
+            yield
+    else:
+        yield
 
-# Mount at /mcp (and no redirect due to redirect_slashes=False)
-app.mount(MCP_BASE_PATH, mcp_app)
+
+# Attach lifespan to app (keeps redirect_slashes config intact)
+app.router.lifespan_context = lifespan
 
 
+# -----------------------------
+# Local entrypoint
+# -----------------------------
 def main():
     port = int(os.environ.get("PORT", "8080"))
     uvicorn.run(
         "meta_ads_mcp_cloudrun.main:app",
         host="0.0.0.0",
         port=port,
+        # Cloud Run forwards headers; this prevents scheme/host confusion if any redirects occur.
         proxy_headers=True,
         forwarded_allow_ips="*",
         log_level=os.getenv("LOG_LEVEL", "info").lower(),
