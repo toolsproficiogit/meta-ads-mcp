@@ -1,6 +1,5 @@
 import contextlib
 import os
-from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -8,18 +7,14 @@ import uvicorn
 
 from mcp.server.fastmcp import FastMCP
 
+from meta_ads_mcp_cloudrun.config import Settings
+
 # -----------------------------
 # Env / config
 # -----------------------------
 
-def _require_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return v
-
-
-API_BEARER_TOKEN = _require_env("API_BEARER_TOKEN")
+SETTINGS = Settings.from_env()
+API_BEARER_TOKEN = SETTINGS.api_bearer_token
 MCP_BASE_PATH = "/mcp"
 PUBLIC_PATHS = {"/healthz"}
 
@@ -38,6 +33,10 @@ async def bearer_auth(request: Request, call_next):
 
     # Public probe endpoint
     if path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    # If no bearer token is configured, skip auth (useful for local dev).
+    if not API_BEARER_TOKEN:
         return await call_next(request)
 
     # Protect MCP endpoints (/mcp and anything under it)
@@ -78,13 +77,14 @@ mcp = FastMCP(
 
 # Register tools (keep your repo pattern)
 from meta_ads_mcp_cloudrun.tools.register import register_read_tools
-register_read_tools(mcp)
+register_read_tools(mcp, SETTINGS)
 
 # In the official MCP SDK, Streamable HTTP ASGI app comes from streamable_http_app()
 mcp_asgi_app = mcp.streamable_http_app()
 
 # Mount MCP endpoint
 app.mount(MCP_BASE_PATH, mcp_asgi_app)
+app.mount(MCP_BASE_PATH + "/", mcp_asgi_app)
 
 
 # -----------------------------
